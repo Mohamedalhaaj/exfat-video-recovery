@@ -1,0 +1,14 @@
+__pycache__/
+*.pyc
+.DS_Store
+*.dmg
+*.img
+# recovery outputs: card listings, serials and recovered footage stay private
+scan*.json
+map*.json
+plan*.json
+*.part
+*.MP4
+*.mp4
+*.MOV
+*.mov
