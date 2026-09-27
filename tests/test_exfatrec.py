@@ -27,6 +27,11 @@ CLI = [sys.executable, os.path.join(ROOT, "exfatrec.py")]
 CONTAINERS = {b"moov", b"trak", b"mdia", b"minf", b"stbl", b"edts", b"dinf"}
 
 
+def read_bytes(path):
+    with open(path, "rb") as f:
+        return f.read()
+
+
 def load(path):
     with open(path, encoding="utf-8") as f:
         return json.load(f)
@@ -375,6 +380,36 @@ class EndToEnd(unittest.TestCase):
                 exfatrec.main(["extract", self.img, self.path("p4.json"), self.path("nospace.MP4")])
         self.assertIn("not enough space", str(cm.exception))
         self.assertFalse(os.path.exists(self.path("nospace.MP4")))
+
+    def test_free_only_map_finds_the_same_orphans(self):
+        run("map", self.img, "--out", self.path("map_full.json"))
+        run("map", self.img, "--free-only", "--out", self.path("map_free.json"))
+        full, free = load(self.path("map_full.json"))["orphans"], load(self.path("map_free.json"))["orphans"]
+        self.assertEqual(sorted(full), sorted(free))
+        for k in full:
+            self.assertEqual({n: v["runs"] for n, v in full[k]["layouts"].items()},
+                             {n: v["runs"] for n, v in free[k]["layouts"].items()})
+
+    def test_preview_decodes_frames_without_touching_the_card(self):
+        run("map", self.img, "--out", self.path("map_p.json"))
+        run("scan", self.img, "--out", self.path("scan_p.json"))
+        before = read_bytes(self.img)
+        out = self.path("preview.html")
+        p = run("preview", self.img, self.path("map_p.json"), self.path("scan_p.json"), "--out", out, "--frames", "4")
+        self.assertEqual(read_bytes(self.img), before)
+        with open(out, encoding="utf-8") as f:
+            page = f.read()
+        self.assertGreaterEqual(page.count("data:image/jpeg;base64,"), 3 * 3)  # 3 intact clips x >= 3 frames
+        self.assertIn(f"header at cluster {self.sony_header:,}", page)
+        self.assertIn("C0003.MP4", page)            # the deleted Sony entry
+        self.assertIn("Recoverable: 100%", page)
+        self.assertIn("0:04", p.stdout)              # the 4-second Sony clip's length
+        self.assertEqual(page.count("<article>"), 4)  # 2 orphans + 2 deleted entries, each shown once
+
+    def test_preview_live_file(self):
+        out = self.path("live.html")
+        p = run("preview", self.img, "--file", "/PRIVATE/M4ROOT/CLIP/C0001.MP4", "--out", out, "--frames", "3")
+        self.assertIn("100.0% survives  3 frame(s)", p.stdout)
 
     def test_verify_fails_without_video(self):
         audio = self.path("audio_only.mp4")

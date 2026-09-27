@@ -4,6 +4,7 @@
     scan     list live and deleted files; explain what sits at a byte offset
     map      classify every cluster and find orphan video headers
     plan     turn an orphan header or a deleted entry into a list of cluster runs
+    preview  decode frames of every clip found into one HTML page, before recovering any
     extract  copy a plan's clusters into a new file on another disk, then trim it
     trim     cut the cluster slack after the last valid MP4 box
     verify   check every indexed video/metadata sample against the file's index
@@ -763,6 +764,16 @@ def cmd_map(a):
     total = (last - first) * cs
     while c < last:
         k = min(BLK, last - c)
+        if a.free_only and all(fs.allocated(c + j) for j in range(k)):
+            # Orphans live only in free space: skip reading blocks that belong to live files.
+            for cc in range(c, c + k):
+                key = ("A", 1, fs.owner(cc))
+                if runs and runs[-1][0] == key and runs[-1][2] == cc:
+                    runs[-1][2] = cc + 1
+                else:
+                    runs.append([key, cc, cc + 1])
+            c += k
+            continue
         buf = dev.read(fs.cl_off(c), k * cs)
         if len(buf) < k * cs:
             die(f"short read at cluster {c}")
@@ -1093,6 +1104,378 @@ def cmd_verify(a):
     print("VERIFY_OK")
 
 
+# --------------------------------------------------------------- preview ----
+
+def _u32s(buf, start, n):
+    return list(struct.unpack(f">{n}I", buf[start:start + 4 * n])) if n else []
+
+
+def parse_movie(moov):
+    """mvhd creation/duration plus, per track, everything needed to find and decode samples."""
+    hdr = 16 if struct.unpack(">I", moov[:4])[0] == 1 else 8
+    movie = {"created": None, "seconds": 0.0, "tracks": []}
+
+    def walk(s0, e0, parent, t):
+        for typ, s, e in iter_children(moov, s0, e0):
+            if typ in MOOV_CHILDREN:
+                walk(s, e, typ, t)
+            elif typ == b"mdhd":
+                t["timescale"] = struct.unpack(">I", moov[s + 20:s + 24] if moov[s] == 1 else moov[s + 12:s + 16])[0]
+            elif typ == b"hdlr" and parent == b"mdia":
+                t["handler"] = moov[s + 8:s + 12]
+            elif typ == b"stsd" and struct.unpack(">I", moov[s + 4:s + 8])[0]:
+                es = s + 8
+                esize, fmt = struct.unpack(">I4s", moov[es:es + 8])
+                t["codec"] = fmt
+                if fmt in NAL_CODECS:
+                    t["width"], t["height"] = struct.unpack(">HH", moov[es + 32:es + 36])
+                    for ct, a, b in iter_children(moov, es + 86, min(es + esize, e)):
+                        if ct in (b"avcC", b"hvcC"):
+                            t["config"] = (ct, moov[a:b])
+            elif typ == b"stts":
+                n = struct.unpack(">I", moov[s + 4:s + 8])[0]
+                v = _u32s(moov, s + 8, 2 * n)
+                t["stts"] = list(zip(v[::2], v[1::2]))
+            elif typ == b"stss":
+                t["sync"] = _u32s(moov, s + 8, struct.unpack(">I", moov[s + 4:s + 8])[0])
+            elif typ == b"stsc":
+                n = struct.unpack(">I", moov[s + 4:s + 8])[0]
+                v = _u32s(moov, s + 8, 3 * n)
+                t["stsc"] = list(zip(v[::3], v[1::3]))
+            elif typ == b"stsz":
+                size, n = struct.unpack(">II", moov[s + 4:s + 12])
+                t["sizes"] = [size] * n if size else _u32s(moov, s + 12, n)
+            elif typ == b"stco":
+                t["chunks"] = _u32s(moov, s + 8, struct.unpack(">I", moov[s + 4:s + 8])[0])
+            elif typ == b"co64":
+                n = struct.unpack(">I", moov[s + 4:s + 8])[0]
+                t["chunks"] = list(struct.unpack(f">{n}Q", moov[s + 8:s + 8 + 8 * n]))
+
+    for typ, s, e in iter_children(moov, hdr, len(moov)):
+        if typ == b"mvhd":
+            if moov[s] == 1:
+                ct, _m, ts, dur = struct.unpack(">QQIQ", moov[s + 4:s + 32])
+            else:
+                ct, _m, ts, dur = struct.unpack(">IIII", moov[s + 4:s + 20])
+            movie["created"] = time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime(ct - 2082844800)) if ct else None
+            movie["seconds"] = dur / ts if ts else 0.0
+        elif typ == b"trak":
+            t = {}
+            walk(s, e, b"trak", t)
+            movie["tracks"].append(t)
+    return movie
+
+
+def sample_table(t):
+    """[(file_offset, size, chunk_index, seconds)] for every sample of a track."""
+    sizes, chunks, stsc = t.get("sizes", []), t.get("chunks", []), t.get("stsc", [])
+    out, si = [], 0
+    bounds = stsc + [(len(chunks) + 1, 0)]
+    for j in range(len(stsc)):
+        first, spc = bounds[j]
+        for chunk in range(first, bounds[j + 1][0]):
+            off = chunks[chunk - 1]
+            for _ in range(spc):
+                if si >= len(sizes):
+                    break
+                out.append([off, sizes[si], chunk - 1, 0.0])
+                off += sizes[si]
+                si += 1
+    scale, now, i = t.get("timescale") or 1, 0, 0
+    for count, delta in t.get("stts", []):
+        for _ in range(count):
+            if i < len(out):
+                out[i][3] = now / scale
+            now += delta
+            i += 1
+    return out
+
+
+def annexb(config, sample):
+    """A decodable H.264/HEVC elementary stream from a length-prefixed sample and its avcC/hvcC."""
+    kind, cfg = config
+    params = []
+    if kind == b"avcC":
+        nal_len = (cfg[4] & 3) + 1
+        p = 6
+        for _ in range(cfg[5] & 0x1F):
+            n = struct.unpack(">H", cfg[p:p + 2])[0]
+            params.append(cfg[p + 2:p + 2 + n])
+            p += 2 + n
+        count, p = cfg[p], p + 1
+        for _ in range(count):
+            n = struct.unpack(">H", cfg[p:p + 2])[0]
+            params.append(cfg[p + 2:p + 2 + n])
+            p += 2 + n
+        fmt = "h264"
+    else:
+        nal_len, p = (cfg[21] & 3) + 1, 23
+        for _ in range(cfg[22]):
+            count = struct.unpack(">H", cfg[p + 1:p + 3])[0]
+            p += 3
+            for _ in range(count):
+                n = struct.unpack(">H", cfg[p:p + 2])[0]
+                params.append(cfg[p + 2:p + 2 + n])
+                p += 2 + n
+        fmt = "hevc"
+    stream = b"".join(b"\0\0\0\1" + x for x in params)
+    q = 0
+    while q + nal_len <= len(sample):
+        n = int.from_bytes(sample[q:q + nal_len], "big")
+        q += nal_len
+        if n <= 0 or q + n > len(sample):
+            break
+        stream += b"\0\0\0\1" + sample[q:q + n]
+        q += n
+    return fmt, stream
+
+
+def decode_jpeg(config, sample, width):
+    if not config or not shutil.which("ffmpeg"):
+        return None
+    fmt, stream = annexb(config, sample)
+    p = subprocess.run(["ffmpeg", "-nostdin", "-v", "error", "-f", fmt, "-i", "pipe:0", "-frames:v", "1",
+                        "-vf", f"scale={width}:-2", "-c:v", "mjpeg", "-q:v", "5", "-f", "image2", "pipe:1"],
+                       input=stream, capture_output=True)
+    return p.stdout if p.returncode == 0 and p.stdout[:2] == b"\xff\xd8" else None
+
+
+def sony_sidecars(fs, c):
+    """Sony writes the clip's thumbnail JPEG and M01.XML right after the header cluster."""
+    found = {}
+    for k in (1, 2, 3):
+        if not (2 <= c + k < fs.maxc) or fs.allocated(c + k):
+            continue
+        blob = fs.dev.read(fs.cl_off(c + k), fs.cs)
+        if blob[:3] == b"\xff\xd8\xff" and "thumb" not in found:
+            end = blob.find(b"\xff\xd9")
+            found["thumb"] = blob[:end + 2] if end > 0 else None
+        elif blob[:5] == b"<?xml" and b"NonRealTimeMeta" in blob[:4096]:
+            text = blob.split(b"\0", 1)[0].decode("utf-8", "replace")
+            for key, pat in (("created", r'CreationDate value="([^"]+)"'), ("model", r'modelName="([^"]+)"'),
+                             ("codec", r'videoCodec="([^"]+)"'), ("fps", r'captureFps="([^"]+)"'),
+                             ("frames", r'<Duration value="(\d+)"')):
+                m = re.search(pat, text)
+                if m:
+                    found[key] = m.group(1)
+    return found
+
+
+def preview_clip(fs, runs, info, n_frames, width, own=False):
+    """Metadata, survival timeline and decoded frames for one clip, read through `runs`.
+    own=True for a live file: its clusters are allocated to itself, not overwritten."""
+    span = info.get("declared_span")
+    read = runs_reader(fs, runs)
+    if info.get("moov_first"):
+        at, size = info["moov_first"]
+    else:
+        h = read(span, 8) if span else None
+        if not h or h[4:8] != b"moov":
+            return {"error": "no index (moov) where the header says: frames cannot be located"}
+        at, size = span, struct.unpack(">I", h[:4])[0]
+    moov = read(at, size)
+    movie = parse_movie(moov)
+    video = next((t for t in movie["tracks"] if t.get("handler") == b"vide" and t.get("codec") in NAL_CODECS), None)
+    card_of = [c for s, e in runs for c in range(s, e)]
+    clip = {"created": movie["created"], "seconds": movie["seconds"], "frames": [], "segments": []}
+    if not video:
+        clip["error"] = "no H.264/HEVC video track to preview"
+        return clip
+    clip.update(codec=video["codec"].decode(), width=video.get("width"), height=video.get("height"))
+    samples = sample_table(video)
+    if len(samples) > 1:
+        clip["fps"] = round((len(samples) - 1) / max(samples[-1][3], 1e-9), 3)
+    good_chunk = {}
+
+    def sample_ok(s):
+        off, size, chunk, _t = s
+        ks = range(off // fs.cs, (off + size - 1) // fs.cs + 1)
+        if any(k >= len(card_of) or (not own and fs.allocated(card_of[k])) for k in ks):
+            return False
+        if chunk not in good_chunk:
+            b = read(video["chunks"][chunk], 8)
+            good_chunk[chunk] = bool(b and len(b) == 8 and _nal_start_ok(b))
+        return good_chunk[chunk]
+
+    ok = [sample_ok(s) for s in samples]
+    for s, g in zip(samples, ok):
+        if clip["segments"] and clip["segments"][-1][0] == g:
+            clip["segments"][-1][2] = s[3]
+        else:
+            clip["segments"].append([g, s[3], s[3]])
+    clip["pct_ok"] = round(100.0 * sum(ok) / len(ok), 1) if ok else 0.0
+    sync = [i - 1 for i in video.get("sync", range(1, len(samples) + 1)) if 0 < i <= len(samples) and ok[i - 1]]
+    if sync:
+        times = [samples[i][3] for i in sync]
+        picks = []
+        for j in range(n_frames):
+            target = clip["seconds"] * (j + 0.5) / n_frames
+            i = bisect.bisect_left(times, target)
+            cand = min((x for x in (i - 1, i) if 0 <= x < len(sync)), key=lambda x: abs(times[x] - target))
+            if sync[cand] not in picks:
+                picks.append(sync[cand])
+        for i in picks:
+            off, size, _c, t = samples[i]
+            jpg = decode_jpeg(video.get("config"), read(off, size), width)
+            clip["frames"].append({"t": t, "jpeg": jpg})
+    return clip
+
+
+def _fmt_t(sec):
+    sec = int(sec)
+    return f"{sec // 3600}:{sec // 60 % 60:02d}:{sec % 60:02d}" if sec >= 3600 else f"{sec // 60}:{sec % 60:02d}"
+
+
+def render_preview_html(title, clips):
+    import base64
+    import html
+    cards = []
+    for n, c in enumerate(clips, 1):
+        p = c["preview"]
+        dur = p.get("seconds") or 0
+        pct = p.get("pct_ok")
+        if c.get("layout") == "file" and not p.get("error"):
+            badge, cls = (f"On the card: {pct}% plays", "ok" if pct == 100.0 else "warn")
+        elif p.get("error"):
+            badge, cls = "Cannot preview", "bad"
+        elif pct == 100.0 and not c.get("overwritten"):
+            badge, cls = "Recoverable: 100%", "ok"
+        elif pct:
+            badge, cls = f"Partial: {pct}% survives", "warn"
+        else:
+            badge, cls = "Overwritten", "bad"
+        bar = "".join(
+            f'<span class="{"g" if g else "r"}" style="width:{max((b - a) / dur * 100, 0.3) if dur else 0:.3f}%" '
+            f'title="{_fmt_t(a)}-{_fmt_t(b)} {"survives" if g else "lost"}"></span>'
+            for g, a, b in p.get("segments", []))
+        frames = "".join(
+            (f'<figure><img src="data:image/jpeg;base64,{base64.b64encode(f["jpeg"]).decode()}" alt="frame at {_fmt_t(f["t"])}">'
+             if f["jpeg"] else '<figure><div class="noimg">not decodable</div>')
+            + f'<figcaption>{_fmt_t(f["t"])}</figcaption></figure>' for f in p.get("frames", []))
+        sc = c.get("sidecar", {})
+        thumb = (f'<img class="thumb" src="data:image/jpeg;base64,{base64.b64encode(c["sidecar"]["thumb"]).decode()}" '
+                 f'alt="camera thumbnail">' if c.get("sidecar", {}).get("thumb") else "")
+        facts = [("Recorded", sc.get("created") or p.get("created") or "?"), ("Length", _fmt_t(dur) if dur else "?"),
+                 ("Size", gb(c["bytes"]) if c.get("bytes") else "?"),
+                 ("Video", f'{p.get("width", "?")}x{p.get("height", "?")} {p.get("codec", "")} {p.get("fps", "")} fps'.strip()),
+                 ("Camera", sc.get("model", "")), ("Where", c["where"]), ("Layout", c.get("layout", ""))]
+        dl = "".join(f"<dt>{k}</dt><dd>{html.escape(str(v))}</dd>" for k, v in facts if v)
+        err = f'<p class="err">{html.escape(p["error"])}</p>' if p.get("error") else ""
+        cards.append(f'''<article>
+<header>{thumb}<div><h2>#{n} · {html.escape(str(sc.get("created") or p.get("created") or "time unknown"))} · {_fmt_t(dur) if dur else "?"}</h2>
+<p class="where">{html.escape(c["name"])}</p><span class="badge {cls}">{badge}</span></div></header>
+<dl>{dl}</dl>{err}
+<div class="bar" aria-label="survival timeline">{bar}</div>
+<div class="axis"><span>0:00</span><span>{_fmt_t(dur) if dur else ""}</span></div>
+<div class="frames">{frames}</div>
+<pre>{html.escape(c["command"])}</pre>
+</article>''')
+    return f'''<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>{html.escape(title)}</title><style>
+:root{{--bg:#f6f5f2;--fg:#1d1d1b;--card:#fff;--mute:#6b6b66;--line:#e2e0da;--ok:#1f8a4c;--warn:#b7791f;--bad:#c0392b}}
+@media (prefers-color-scheme:dark){{:root{{--bg:#151514;--fg:#ecebe6;--card:#1f1f1d;--mute:#9a9a93;--line:#33332f}}}}
+body{{margin:0;background:var(--bg);color:var(--fg);font:15px/1.45 -apple-system,system-ui,sans-serif}}
+main{{max-width:1100px;margin:0 auto;padding:24px 16px}} h1{{font-size:22px;margin:0 0 4px}} .sub{{color:var(--mute);margin:0 0 20px}}
+article{{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:16px;margin:0 0 18px}}
+article header{{display:flex;gap:14px;align-items:center}} h2{{font-size:17px;margin:0 0 6px}}
+.thumb{{width:120px;border-radius:6px}} .badge{{font-size:12px;font-weight:600;padding:3px 8px;border-radius:99px;color:#fff}}
+.ok{{background:var(--ok)}} .warn{{background:var(--warn)}} .bad{{background:var(--bad)}}
+dl{{display:grid;grid-template-columns:max-content 1fr;gap:2px 14px;margin:12px 0}} dt{{color:var(--mute)}} dd{{margin:0}}
+.bar{{display:flex;height:12px;border-radius:6px;overflow:hidden;background:var(--line)}} .bar .g{{background:var(--ok)}} .bar .r{{background:var(--bad)}}
+.axis{{display:flex;justify-content:space-between;color:var(--mute);font-size:12px;margin:2px 0 12px}}
+.frames{{display:grid;grid-template-columns:repeat(auto-fill,minmax(160px,1fr));gap:8px}}
+figure{{margin:0}} figure img,.noimg{{width:100%;aspect-ratio:16/9;object-fit:cover;border-radius:6px;background:var(--line)}}
+.noimg{{display:flex;align-items:center;justify-content:center;color:var(--mute);font-size:12px}}
+figcaption{{color:var(--mute);font-size:12px;text-align:center;font-variant-numeric:tabular-nums}}
+pre{{background:var(--bg);border:1px solid var(--line);border-radius:8px;padding:8px 10px;overflow-x:auto;font-size:12px;margin:12px 0 0}}
+.where{{color:var(--mute);margin:0 0 6px;font-size:13px}}
+.err{{color:var(--bad)}}</style></head><body><main>
+<h1>{html.escape(title)}</h1><p class="sub">Frames are decoded straight from the card; nothing has been recovered or written yet.
+Green = survives, red = overwritten by newer files.</p>
+{"".join(cards) or "<p>No video found.</p>"}
+</main></body></html>'''
+
+
+def cmd_preview(a):
+    sources = []
+    if not a.sources and not a.file:
+        die("give map/scan JSON files and/or --file PATH")
+    for path in a.sources:
+        with open(path, encoding="utf-8") as f:
+            sources.append((path, json.load(f)))
+    dev = Device(a.device)
+    refuse_if_on_card(dev, a.out)
+    fs = ExFAT(dev, sources[0][1]["geometry"]["part_offset"] if sources else resolve_part(dev, "auto"))
+    for path, src in sources:
+        if fs.serial != src["geometry"]["serial"]:
+            die(f"{path} was made from another card (volume serial differs)")
+    me = f"python3 {shlex.quote(os.path.abspath(sys.argv[0]))}"
+    clips = []
+    named = {r["first_cluster"] for _p, src in sources for r in src.get("records", [])
+             if r.get("deleted") and r.get("runs") and r.get("head", "")[4:8] == "ftyp"}
+    for src_path, src in sources:
+        preview_source(fs, src_path, src, a, me, clips, named)
+    for path in a.file or []:
+        rec = next((r for r in fs.records if not r["deleted"] and r["path"] == path), None)
+        if rec is None:
+            die(f"no live file {path!r} on the card")
+        runs = fs.runs_for(rec["first_cluster"], rec["size"], rec["nofatchain"])
+        info = header_info(fs.dev.read(fs.cl_off(runs[0][0]), fs.cs))
+        log(f"previewing live file {path}...")
+        clips.append({"name": path, "where": "live file on the card", "layout": "file", "bytes": rec["size"],
+                      "command": "already on the card", "sidecar": {},
+                      "preview": preview_clip(fs, runs, info, a.frames, a.width, own=True)})
+    finish_preview(fs, a, clips)
+
+
+def preview_source(fs, src_path, src, a, me, clips, named):
+    for key, o in src.get("orphans", {}).items():
+        if (a.header and int(key) not in a.header) or int(key) in named:
+            continue  # a deleted entry still names this clip: it is shown under its file name instead
+        if fs.allocated(int(key)):
+            log(f"skipping header {int(key):,}: it belongs to a file again (already restored?)")
+            continue
+        lays = o.get("layouts", {})
+        name = max(lays, key=lambda n: (lays[n]["status"] == "verified", -lays[n]["overwritten_clusters"],
+                                        lays[n]["samples_checked"] - lays[n]["samples_bad"]), default=None)
+        entry = {"name": f"Lost clip, header at cluster {int(key):,}", "where": f"orphan header, cluster {int(key):,}",
+                 "layout": name or "none", "bytes": lays[name]["bytes"] if name else o.get("declared_span"),
+                 "overwritten": lays[name]["overwritten_clusters"] if name else None,
+                 "command": f"{me} plan {shlex.quote(src_path)} --header {int(key)} --out plan.json",
+                 "sidecar": sony_sidecars(fs, int(key))}
+        log(f"previewing header {int(key):,} ({name or 'no layout'})...")
+        entry["preview"] = preview_clip(fs, lays[name]["runs"], o, a.frames, a.width) if name else \
+            {"error": o.get("note") or "no layout matched"}
+        clips.append(entry)
+    for r in src.get("records", []):
+        if not (r.get("deleted") and r.get("runs") and r.get("head", "")[4:8] == "ftyp"):
+            continue
+        head = fs.dev.read(fs.cl_off(r["runs"][0][0]), fs.cs)
+        info = header_info(head)
+        log(f"previewing deleted {r['path']}...")
+        clips.append({"name": r["path"], "where": f"deleted entry, first cluster {r['first_cluster']:,}",
+                      "layout": r.get("runs_method", ""), "bytes": r["size"], "overwritten": r.get("overwritten_clusters"),
+                      "command": f"{me} plan {shlex.quote(src_path)} --entry {shlex.quote(r['path'])} --out plan.json",
+                      "sidecar": {}, "preview": preview_clip(fs, r["runs"], info, a.frames, a.width)})
+
+
+def finish_preview(fs, a, clips):
+    clips.sort(key=lambda c: c["preview"].get("created") or "")
+    page = render_preview_html(f"Videos found on card {fs.serial}", clips)
+    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(a.out, flags, 0o644)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        f.write(page)
+        f.flush()
+        chown_to_sudo_user(f.fileno())
+    for c in clips:
+        p = c["preview"]
+        print(f"{c['name']}: {p.get('created') or '?'}  {_fmt_t(p['seconds']) if p.get('seconds') else '?'}  "
+              f"{p.get('pct_ok', 0)}% survives  {len([f for f in p.get('frames', []) if f['jpeg']])} frame(s)"
+              + (f"  [{p['error']}]" if p.get("error") else ""))
+    print(f"wrote {a.out}: open it in a browser to see the clips before recovering any")
+
+
 # ------------------------------------------------------------------ main ----
 
 def main(argv=None):
@@ -1118,6 +1501,8 @@ def main(argv=None):
     sp.add_argument("--out", required=True, help="JSON file for the cluster map (not on the card)")
     sp.add_argument("--first-cluster", type=int, default=2)
     sp.add_argument("--last-cluster", type=int, help="stop before this cluster (default: end of card)")
+    sp.add_argument("--free-only", action="store_true",
+                    help="skip reading clusters that live files own (much faster; orphans are only in free space)")
     sp.set_defaults(func=cmd_map)
 
     sp = sub.add_parser("plan", help="turn an orphan header (map) or a deleted entry (scan) into cluster runs")
@@ -1143,6 +1528,16 @@ def main(argv=None):
     sp.add_argument("file")
     sp.add_argument("--dry-run", action="store_true")
     sp.set_defaults(func=cmd_trim)
+
+    sp = sub.add_parser("preview", help="decode frames of every clip found, into one HTML page, before recovering")
+    sp.add_argument("device")
+    sp.add_argument("sources", nargs="*", help="JSON from `map` and/or `scan`")
+    sp.add_argument("--file", action="append", help="also preview a live file on the card, e.g. /PRIVATE/M4ROOT/CLIP/C0001.MP4")
+    sp.add_argument("--out", required=True, help="HTML file to write (not on the card)")
+    sp.add_argument("--frames", type=int, default=6, help="frames per clip (default 6)")
+    sp.add_argument("--width", type=int, default=480, help="frame width in pixels (default 480)")
+    sp.add_argument("--header", type=int, action="append", help="only this orphan header (repeatable)")
+    sp.set_defaults(func=cmd_preview)
 
     sp = sub.add_parser("verify", help="check every indexed sample of a recovered MP4 (needs ffprobe)")
     sp.add_argument("file")

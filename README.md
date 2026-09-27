@@ -69,8 +69,14 @@ mkdir -p ~/exfatrec-work && cd ~/exfatrec-work # keep outputs off the card
 # 1. What was deleted? (deleted entries, how much of each is overwritten, and whether its layout is verified)
 sudo python3 /path/to/exfatrec.py scan /dev/rdisk4 --out scan.json
 
-# 2. Find orphan video headers (reads the whole card: about 25 min for 128 GB at 90 MB/s)
-sudo python3 /path/to/exfatrec.py map /dev/rdisk4 --out map.json
+# 2. Find orphan video headers. --free-only reads only free space, where lost clips live
+#    (much faster than the whole card)
+sudo python3 /path/to/exfatrec.py map /dev/rdisk4 --free-only --out map.json
+
+# 2b. SEE the clips before recovering anything: one HTML page with real frames from each clip,
+#     its recording time and length, and a green/red bar of what survived
+sudo python3 /path/to/exfatrec.py preview /dev/rdisk4 map.json scan.json --out preview.html
+open preview.html
 
 # 3. Make a plan. Use the "header at cluster N" number printed by `map`, or a path printed by `scan`:
 python3 /path/to/exfatrec.py plan map.json --header 765839 --out plan.json
@@ -95,7 +101,8 @@ same (this path has not been tested on a Linux machine yet).
 | command | what it does |
 |---|---|
 | `scan`    | Lists live and deleted directory entries. For each deleted file it gives the runs to copy, the method (`contiguous`, `FAT chain intact`, or a layout verified against the moov when the chain is lost), and how much of it is now overwritten. It also flags files still in the card's Trash. `--offset N` walks the MP4 boxes at a byte offset. |
-| `map`     | Classifies every cluster (zero, header, moov, Sony metadata, data), with allocation and owner. It lists orphan headers with each matching layout's status: `RECOVERABLE` (verified and intact), overwritten, or frames failed. |
+| `map`     | Classifies every cluster (zero, header, moov, Sony metadata, data), with allocation and owner. `--free-only` skips clusters that live files own. It lists orphan headers with each matching layout's status: `RECOVERABLE` (verified and intact), overwritten, or frames failed. |
+| `preview` | Decodes real frames from every clip found (orphans from `map`, deleted entries from `scan`, or live files with `--file PATH`) straight from the card, reading only a few MB per frame. It writes one self-contained HTML page. Each clip gets a numbered card with its recording time, length, size, resolution, camera model and thumbnail (from Sony's sidecar files when they survive), a timeline bar of the surviving parts, frames across its length, and the command to recover it. Nothing is recovered or written to the card. |
 | `plan`    | Turns an orphan header (`--header`) or a deleted entry (`--entry`, plus `--entry-cluster` when two share a path) into cluster runs. `--layout` picks `header-last`, `header-first` or `fat-chain`. `--force` accepts unverified or overwritten layouts. `--force --layout header-first --max-bytes N` copies an unfinalized recording (never from a Sony header-last header). |
 | `extract` | Copies the runs into a new file on another disk. It then cuts the file to the directory entry's size, or trims the slack after the last MP4 box. |
 | `trim`    | Trims an MP4 by hand. `--dry-run` shows what would be cut. |
@@ -190,7 +197,8 @@ diskutil list                                   # اعرف رقم البطاقة
 diskutil unmount /dev/disk4s1                   # افصلها حتى لا يكتب عليها النظام
 mkdir -p ~/exfatrec-work && cd ~/exfatrec-work  # مجلد عمل خارج البطاقة
 sudo python3 /path/to/exfatrec.py scan /dev/rdisk4 --out scan.json      # الملفات المحذوفة
-sudo python3 /path/to/exfatrec.py map  /dev/rdisk4 --out map.json       # الرؤوس اليتيمة
+sudo python3 /path/to/exfatrec.py map  /dev/rdisk4 --free-only --out map.json   # الرؤوس اليتيمة
+sudo python3 /path/to/exfatrec.py preview /dev/rdisk4 map.json scan.json --out preview.html   # معاينة قبل الاسترجاع
 python3 /path/to/exfatrec.py plan map.json --header <رقم_الكلستر> --out plan.json
 #   أو لملف محذوف ظهر في scan:
 #   python3 /path/to/exfatrec.py plan scan.json --entry /PRIVATE/M4ROOT/CLIP/C0100.MP4 --out plan.json
@@ -199,6 +207,15 @@ python3 /path/to/exfatrec.py verify ~/Movies/recovered.MP4 --decode
 ```
 
 </div>
+
+**المعاينة قبل الاسترجاع:** أمر `preview` يصنع صفحة واحدة فيها بطاقة مرقَّمة لكل فيديو. في كل بطاقة:
+
+- إطارات حقيقية من داخل الفيديو، تُقرأ مباشرة من البطاقة.
+- تاريخ التصوير والمدة والحجم.
+- شريط أخضر وأحمر يوضّح الأجزاء التي بقيت والأجزاء التي كُتب فوقها.
+- الأمر الجاهز لاسترجاع الفيديو.
+
+وهكذا تختار ما تريده قبل استرجاع أي شيء. أمر المعاينة لا يكتب على البطاقة أي شيء.
 
 **نصائح:**
 
